@@ -17,7 +17,7 @@ from sklearn.metrics import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA = ROOT / "data" / "atg_starters_sample.csv"
+DATA = ROOT / "data" / "atg_starters.csv"
 
 FEATURES = [
     "trainer_change",
@@ -130,6 +130,16 @@ def run_mvp(path: Path | None = None) -> MvpResult:
         metrics["roc_auc"] = float(roc_auc_score(yte, proba))
     except ValueError:
         metrics["roc_auc"] = None
+
+    if "prior_starts" in df.columns:
+        prior = pd.to_numeric(df["prior_starts"], errors="coerce").fillna(0)
+        metrics["prior_start_rate"] = float((prior > 0).mean())
+        metrics["rows_with_prior"] = int((prior > 0).sum())
+    if "distance_form_source" in df.columns:
+        metrics["distance_form_starts_rate"] = float((df["distance_form_source"] == "starts").mean())
+    if "trainer_change" in df.columns:
+        changed = pd.to_numeric(df["trainer_change"], errors="coerce").fillna(0)
+        metrics["trainer_change_rate"] = float((changed == 1).mean())
 
     proba_s = pd.Series(proba, index=Xte.index)
     top1_ok = 0

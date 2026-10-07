@@ -11,7 +11,12 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from fetch_atg_sample import apply_history, rows_from_game  # noqa: E402
+from fetch_atg_sample import (  # noqa: E402
+    apply_history,
+    rows_from_game,
+    rows_from_race,
+    swedish_result_race_ids,
+)
 from predict_live import build_suggestion  # noqa: E402
 
 
@@ -85,6 +90,86 @@ class HistoryTest(unittest.TestCase):
         self.assertEqual(rows[1]["trainer_change"], 1)
         self.assertAlmostEqual(rows[1]["distance_form"], 0.5)
         self.assertEqual(rows[1]["distance_starts_prior"], 1)
+        self.assertEqual(rows[1]["prior_starts"], 1)
+        self.assertEqual(rows[1]["distance_form_source"], "starts")
+
+    def test_same_day_race_number_orders_history(self):
+        rows = [
+            {
+                "date": "2025-01-01",
+                "race_id": "2025-01-01_5_10",
+                "horse_id": 10,
+                "trainer_id": 2,
+                "distance_class": "medium",
+                "place": 1,
+                "distance": 2140,
+            },
+            {
+                "date": "2025-01-01",
+                "race_id": "2025-01-01_5_6",
+                "horse_id": 10,
+                "trainer_id": 1,
+                "distance_class": "medium",
+                "place": 3,
+                "distance": 2140,
+            },
+        ]
+        apply_history(rows)
+        later = next(row for row in rows if row["race_id"].endswith("_10"))
+        earlier = next(row for row in rows if row["race_id"].endswith("_6"))
+        self.assertEqual(earlier["prior_starts"], 0)
+        self.assertEqual(later["trainer_change"], 1)
+        self.assertEqual(later["prior_starts"], 1)
+        self.assertAlmostEqual(later["distance_form"], round(1 / 3, 4))
+
+
+class RaceRowsTest(unittest.TestCase):
+    def test_decimal_final_odds_and_swedish_filter(self):
+        race = {
+            "id": "2025-10-25_7_3",
+            "date": "2025-10-25",
+            "name": "Testlopp",
+            "distance": 2140,
+            "startMethod": "auto",
+            "sport": "trot",
+            "status": "results",
+            "track": {"id": 7, "name": "Jägersro", "countryCode": "SE", "condition": "light"},
+            "starts": [
+                _start(1, 1, "A", 2.0),
+                _start(2, 2, "B", 4.0),
+                _start(3, 3, "C", 4.0),
+                _start(4, 4, "D", 8.0),
+                _start(5, 5, "E", 8.0),
+            ],
+        }
+        rows = rows_from_race(race)
+        self.assertEqual(len(rows), 5)
+        self.assertAlmostEqual(rows[0]["final_odds"], 2.0)
+        self.assertAlmostEqual(sum(row["market_implied_prob"] for row in rows), 1.0, places=5)
+        self.assertEqual(rows[0]["game_type"], "race")
+        calendar = {
+            "tracks": [
+                {
+                    "countryCode": "SE",
+                    "sport": "trot",
+                    "races": [
+                        {"id": "2025-10-25_7_1", "status": "results"},
+                        {"id": "2025-10-25_7_2", "status": "upcoming"},
+                    ],
+                },
+                {
+                    "countryCode": "NO",
+                    "sport": "trot",
+                    "races": [{"id": "2025-10-25_99_1", "status": "results"}],
+                },
+                {
+                    "countryCode": "SE",
+                    "sport": "gallop",
+                    "races": [{"id": "2025-10-25_40_1", "status": "results"}],
+                },
+            ]
+        }
+        self.assertEqual(swedish_result_race_ids(calendar), ["2025-10-25_7_1"])
 
 
 class SuggestionTest(unittest.TestCase):
@@ -104,6 +189,23 @@ class SuggestionTest(unittest.TestCase):
         self.assertEqual(suggestion["system_notation"], "1/2-4")
         self.assertEqual(suggestion["n_system_rows"], 2)
         self.assertEqual(suggestion["legs"][0]["reserves"][0]["horse_name"], "B")
+
+
+def _start(number, place, name, odds):
+    return {
+        "number": number,
+        "postPosition": number,
+        "horse": {
+            "id": 1000 + number,
+            "name": name,
+            "age": 5,
+            "sex": "gelding",
+            "trainer": {"id": 50 + number, "firstName": "T", "lastName": name},
+            "statistics": {"life": {"starts": 10, "winPercentage": 1000, "placePercentage": 2000}},
+        },
+        "driver": {"id": 80 + number, "firstName": "K", "lastName": name},
+        "result": {"place": place, "finalOdds": odds},
+    }
 
 
 def _starter(leg, number, name, model_p, market_p):

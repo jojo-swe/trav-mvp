@@ -6,7 +6,9 @@ Obligatoriska faktorer:
   2) distance_form   – form betingad på distansklass (short/medium/long)
   3) market_*        – marknadspris (implicerad sannolikhet / poolandel)
 
-Datakälla: data/atg_starters_sample.csv (ATG racinginfo, offentligt JSON-API).
+Datakälla: data/atg_starters.csv (ATG racinginfo, alla avslutade svenska travlopp
+i hämtningsfönstret). Bygg om med:
+  python scripts/fetch_atg_sample.py --expand --from-date 2025-10-10 --to-date 2026-10-09 --game-id V85_2026-10-10_5_6
 """
 from __future__ import annotations
 
@@ -19,6 +21,13 @@ def main():
     print("=== Trav MVP (HistGradientBoosting) ===")
     print(f"Data: {m['data_path']}")
     print(f"Starter totalt: {m['n_total']} | train: {m['n_train']} | test: {m['n_test']}")
+    if m.get("prior_start_rate") is not None:
+        print(
+            f"Rader med tidigare start: {m.get('rows_with_prior')} "
+            f"({m['prior_start_rate']:.1%}) | "
+            f"distansform från starter: {m.get('distance_form_starts_rate', 0):.1%} | "
+            f"tränarbyte: {m.get('trainer_change_rate', 0):.1%}"
+        )
     print(f"Train-datum < {m['cut_date']} | test >= {m['cut_date']}")
     print(f"Features ({len(FEATURES)}): {', '.join(FEATURES)}")
     print()
