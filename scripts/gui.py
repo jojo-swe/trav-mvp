@@ -203,7 +203,7 @@ def main():
     c4.metric("Top-1 marknad", f"{m['top1_market_count']}/{m['n_races']} ({_fmt_pct(m['top1_market'])})")
 
     st.markdown(
-        f'<p class="section-note">Stickprov: <strong>{m["n_total"]}</strong> starter · '
+        f'<p class="section-note">Historik: <strong>{m["n_total"]}</strong> starter · '
         f'train &lt; {m["cut_date"]} ({m["n_train"]}) · '
         f'test ≥ {m["cut_date"]} ({m["n_test"]} starter, {m["n_races"]} lopp) · '
         f'Brier {m["brier"]:.4f}</p>',

@@ -25,14 +25,13 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from fetch_atg_sample import (  # noqa: E402
+    HISTORY_CSV,
     LIVE_DIR,
-    OUT,
     STOCKHOLM,
     apply_history,
     discover_vgame,
     fetch_game,
     history_from_csv,
-    norm_id,
     rows_from_game,
     save_live_payloads,
     stockholm_today,
@@ -82,6 +81,13 @@ def _horse_bits(row: pd.Series) -> dict:
         "value": _num(row["value"], 3),
         "trainer_change": None if pd.isna(row.get("trainer_change")) else int(row["trainer_change"]),
         "distance_form": _num(row.get("distance_form"), 3),
+        "prior_starts": None if pd.isna(row.get("prior_starts")) else int(row["prior_starts"]),
+        "distance_starts_prior": (
+            None
+            if pd.isna(row.get("distance_starts_prior"))
+            else int(row["distance_starts_prior"])
+        ),
+        "distance_form_source": row.get("distance_form_source") or "",
     }
 
 
@@ -188,6 +194,7 @@ def render_report(
     metrics: dict,
     n_full: int,
     n_hist_horses: int,
+    n_distance_form: int,
     n_starters: int,
     suggestion: dict,
     paths: dict[str, Path],
@@ -200,7 +207,7 @@ def render_report(
         f"Start: {start_time or '–'}   Avdelningar: {len(suggestion['legs'])}",
         (
             f"Modell: HistGradientBoosting tränad på {n_full} historiska starter "
-            f"({OUT.name})."
+            f"({HISTORY_CSV.name})."
         ),
         (
             f"Tidsplit-test (före {metrics.get('cut_date')} / från {metrics.get('cut_date')}): "
@@ -213,11 +220,14 @@ def render_report(
             f"= {_fmt(metrics.get('top1_market'), '.1%')}."
         ),
         (
-            f"Tränarbyte och distansform slås upp i stickprovet: "
-            f"{n_hist_horses} av {n_starters} starter är hästar som finns där. "
-            "Saknas hästen blir tränarbyte=0 och distansform tas från rekordet i distansklassen."
+            f"Historik mot live-startlistan: {n_hist_horses}/{n_starters} "
+            f"({(n_hist_horses / n_starters) if n_starters else 0:.1%}) har minst en tidigare start. "
+            f"Distansform från tidigare starter i samma klass: {n_distance_form}/{n_starters} "
+            f"({(n_distance_form / n_starters) if n_starters else 0:.1%}). "
+            "Saknas tidigare start blir tränarbyte=0. Saknas samma distansklass används rekordet i klassen."
         ),
-        "marknad = normaliserad 1/vinnarodds. value = model_p / marknad.",
+        "marknad = normaliserad 1/vinnarodds (historiskt stängningsodds, live är aktuellt odds). value = model_p / marknad.",
+        "Personlig analys. Inga kuponger skickas och inga spel läggs.",
         "",
         "════════════════════════════════════════",
         "ENKEL VINNARRAD  (högst model_p per avdelning)",
@@ -232,7 +242,9 @@ def render_report(
             f"model_p={spik['model_p']:.3f}  marknad={_fmt(spik['market_p'], '.3f')}  "
             f"value={_fmt(spik['value'], '.2f')}  "
             f"tränarbyte={spik['trainer_change']}  "
-            f"distansform={_fmt(spik['distance_form'], '.3f')}  ({role})"
+            f"distansform={_fmt(spik['distance_form'], '.3f')}  "
+            f"tidigare={spik.get('prior_starts')}  "
+            f"distansstarter={spik.get('distance_starts_prior')}  ({role})"
         )
 
     lines += [
@@ -309,7 +321,9 @@ def _line_from_bits(rank: int, horse: dict) -> str:
         f"marknad={_fmt(horse['market_p'], '.3f')}  "
         f"value={_fmt(horse['value'], '.2f')}  "
         f"tränarbyte={change_s}  "
-        f"distansform={_fmt(horse['distance_form'], '.3f')}"
+        f"distansform={_fmt(horse['distance_form'], '.3f')}  "
+        f"tidigare={horse.get('prior_starts')}  "
+        f"distansstarter={horse.get('distance_starts_prior')}"
     )
 
 
@@ -400,29 +414,30 @@ def main(argv: list[str] | None = None) -> int:
     if not rows:
         print(f"{hit.game_id} saknar starter.", file=sys.stderr)
         return 1
-    if not OUT.exists():
-        print(f"Saknar historik: {OUT}", file=sys.stderr)
+    if not HISTORY_CSV.exists():
+        print(
+            f"Saknar historik: {HISTORY_CSV}. Kör först "
+            "python scripts/fetch_atg_sample.py --expand --from-date 2025-10-10 "
+            "--to-date 2026-10-09 --game-id V85_2026-10-10_5_6",
+            file=sys.stderr,
+        )
         return 1
 
-    history = history_from_csv(OUT)
-    known = {
-        norm_id(row.get("horse_id"))
-        for row in rows
-        if norm_id(row.get("horse_id")) in history
-    }
+    history = history_from_csv(HISTORY_CSV)
     apply_history(rows, extra_events=history)
     paths = save_live_payloads(hit, game, rows)
     paths["text"] = text_path
     paths["json"] = json_path
 
     print("Tränar modell på historiska starter…")
-    evaluation = run_mvp(OUT)
-    historical = load_starters(OUT)
+    evaluation = run_mvp(HISTORY_CSV)
+    historical = load_starters(HISTORY_CSV)
     fitted = fit_full(historical)
     scored = score_starters(fitted, pd.DataFrame(rows))
     suggestion = build_suggestion(scored)
     track = next((row.get("track_name") for row in rows if row.get("track_name")), "")
-    n_hist = sum(1 for row in rows if norm_id(row.get("horse_id")) in known)
+    n_hist = sum(1 for row in rows if (row.get("prior_starts") or 0) > 0)
+    n_dist = sum(1 for row in rows if (row.get("distance_starts_prior") or 0) > 0)
     report = render_report(
         hit_date=hit.date,
         game_type=hit.game_type,
@@ -433,6 +448,7 @@ def main(argv: list[str] | None = None) -> int:
         metrics=evaluation.metrics,
         n_full=fitted.n_rows,
         n_hist_horses=n_hist,
+        n_distance_form=n_dist,
         n_starters=len(rows),
         suggestion=suggestion,
         paths=paths,
@@ -451,7 +467,11 @@ def main(argv: list[str] | None = None) -> int:
         "trained_on_rows": fitted.n_rows,
         "evaluation": evaluation.metrics,
         "starters_with_history": n_hist,
+        "starters_with_distance_form": n_dist,
         "starters": len(rows),
+        "history_coverage": (n_hist / len(rows)) if rows else None,
+        "distance_form_coverage": (n_dist / len(rows)) if rows else None,
+        "history_csv": str(HISTORY_CSV),
         "enkelrad": suggestion["enkelrad"],
         "value_rad": suggestion["value_rad"],
         "marknad_rad": suggestion["marknad_rad"],

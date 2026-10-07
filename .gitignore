@@ -8,3 +8,5 @@ venv/
 data/*.json
 !data/atg_starters_sample.csv
 data/live/
+data/history/
+data/raw/

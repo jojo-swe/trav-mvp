@@ -9,16 +9,20 @@ Personligt forskningsprojekt: historisk svensk travdata → vinstsannolikheter p
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+# utökad historik: alla avslutade svenska travlopp (återupptagbart, ≥0,4 s mellan anrop)
+python scripts/fetch_atg_sample.py --expand --from-date 2025-10-10 --to-date 2026-10-09 --game-id V85_2026-10-10_5_6
 python scripts/train_mvp.py
 # nästa V75/V85: hämta live-data, träna, skriv vinnarrad
 python scripts/predict_live.py
 # grafiskt gränssnitt
 streamlit run scripts/gui.py
-# valfritt: hämta om stickprovet
+# valfritt: litet V-omgångsstickprov (inte träningsfilen)
 # python scripts/fetch_atg_sample.py
 ```
 
-`predict_live.py` tittar upp till 14 dagar framåt från idag (Europe/Stockholm), tar dagens V75/V85 om den fortfarande är spelbar, annars nästa publicerade omgång. Den sparar startlista och rå-JSON under `data/live/`, tränar på `data/atg_starters_sample.csv` och skriver enkelrad plus ett litet system till stdout och `data/live/suggested_rows.txt`. Minst 0,4 s mellan varje HTTP-anrop. Inga kuponger skickas till ATG.
+`predict_live.py` tittar upp till 14 dagar framåt från idag (Europe/Stockholm), tar dagens V75/V85 om den fortfarande är spelbar, annars nästa publicerade omgång. Den sparar startlista och rå-JSON under `data/live/`, tränar på `data/atg_starters.csv` och skriver enkelrad plus ett litet system till stdout och `data/live/suggested_rows.txt`. Minst 0,4 s mellan varje HTTP-anrop. Inga kuponger skickas till ATG.
+
+Historiken byggs av `fetch_atg_sample.py --expand`: kalenderdag → avslutade travlopp på svenska banor → starter. Rå-JSON och checkpoint (`data/history/`) är gitignorerade. Tränings-CSV:n `data/atg_starters.csv` är den fil `train_mvp` / `predict_live` läser. `--game-id` hämtar dessutom `horses/{id}` för startande som saknar tidigare start eller distansform, och fyller på med de loppen. Avbruten hämtning fortsätter från `data/history/done_races.txt`.
 
 ## V75 vs V85 (struktur, okt 2026)
 
@@ -128,8 +132,10 @@ trav-mvp/
   README.md
   requirements.txt
   .gitignore
-  data/atg_starters_sample.csv   # riktigt ATG-stickprov (~1500 starter, V75+V85)
-  data/*.json                    # exempel-payloads (kan ignoreras i git)
+  data/atg_starters.csv          # primär träning: svenska travstarter (fetch --expand)
+  data/atg_starters_sample.csv   # litet V75/V85-stickprov, används av parsertestet
+  data/history/                  # jsonl-checkpoint från --expand (gitignorerad)
+  data/*.json                    # exempel-payloads (gitignorerade)
   data/live/                     # skapas av predict_live.py (gitignorerad)
   scripts/fetch_atg_sample.py    # racinginfo-hämtning, delas med live
   scripts/mvp_core.py            # delad träningskärna
@@ -154,11 +160,10 @@ Marknaden är ett starkt baseline på detta lilla stickprov — modellens jobb i
 
 ### Nästa steg mot produktion
 
-1. Bulk historik via ATG partner AIS / textfiler **eller** långsam lawful hämtning av racinginfo dag-för-dag.  
-2. Bygg tränarbyte + distansform på **full** startlista per häst (inte bara V-omgångar).  
-3. Snapshotta **pre-race** odds (inte bara finalOdds) för äkta marknadsfeatures.  
-4. Benter-blend + V-system simulator (kostnad, 5–8 rätt-fördelning).  
-5. Undvik allt som liknar förbjudet robotspel.
+1. Ännu längre fönster (flera år) om en live-omgång fortfarande har hästar utan svensk start.
+2. Snapshotta **pre-race** odds (inte bara finalOdds) för äkta marknadsfeatures.
+3. Benter-blend + V-system simulator (kostnad, 5–8 rätt-fördelning).
+4. Undvik allt som liknar förbjudet robotspel.
 
 ## Licens / privat
 
