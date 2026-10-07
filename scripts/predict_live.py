@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""Hämta nästa V75/V85 och skriv en föreslagen vinnarrad.
+
+Personlig analys — inte finansiell rådgivning. Placera inga spel automatiskt.
+ATG förbjuder robotspel (automatiserad kupongoptimering mot andra).
+
+Kör från repots rot:
+    python scripts/predict_live.py
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+import urllib.error
+from datetime import datetime
+from itertools import product
+from pathlib import Path
+
+import pandas as pd
+
+SCRIPTS = Path(__file__).resolve().parent
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
+from fetch_atg_sample import (  # noqa: E402
+    LIVE_DIR,
+    OUT,
+    STOCKHOLM,
+    apply_history,
+    discover_vgame,
+    fetch_game,
+    history_from_csv,
+    norm_id,
+    rows_from_game,
+    save_live_payloads,
+    stockholm_today,
+)
+from mvp_core import fit_full, load_starters, run_mvp, score_starters  # noqa: E402
+
+DISCLAIMER = (
+    "Personlig analys, inte finansiell rådgivning och inte speltips. "
+    "Placera inga spel automatiskt. ATG förbjuder robotspel."
+)
+# Value-häst tas med i garderingen om den är en annan häst och minst så här
+# mycket bättre value än spiken. Jämförelsen är relativ inom avdelningen.
+VALUE_EDGE = 1.20
+
+
+def _num(value, digits: int = 6):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number) or math.isinf(number):
+        return None
+    return round(number, digits)
+
+
+def _fmt(value, spec: str, missing: str = "–") -> str:
+    number = _num(value)
+    if number is None:
+        return missing
+    return format(number, spec)
+
+
+def _horse_bits(row: pd.Series) -> dict:
+    return {
+        "start_number": int(row["start_number"]),
+        "horse_name": row["horse_name"],
+        "trainer_name": row.get("trainer_name") or "",
+        "model_p": _num(row["model_p"], 4),
+        "market_p": _num(row["market_p"], 4),
+        "value": _num(row["value"], 3),
+        "trainer_change": None if pd.isna(row.get("trainer_change")) else int(row["trainer_change"]),
+        "distance_form": _num(row.get("distance_form"), 3),
+    }
+
+
+def _rank(frame: pd.DataFrame, column: str) -> pd.DataFrame:
+    work = frame.copy()
+    work["_key"] = pd.to_numeric(work[column], errors="coerce")
+    return work.sort_values(
+        ["_key", "model_p"], ascending=[False, False], na_position="last"
+    ).drop(columns="_key")
+
+
+def _coupon(numbers: list[list[int]]) -> str:
+    parts = []
+    for group in numbers:
+        parts.append("/".join(str(number) for number in group))
+    return "-".join(parts)
+
+
+def build_suggestion(scored: pd.DataFrame) -> dict:
+    """Enkelrad, reserver och ett litet favorit+value-system."""
+    legs = []
+    spik_numbers: list[list[int]] = []
+    value_numbers: list[int] = []
+    market_numbers: list[int] = []
+    system_groups: list[list[int]] = []
+
+    order = (
+        scored[["leg", "race_id"]]
+        .drop_duplicates()
+        .sort_values("leg")
+    )
+    for _, key in order.iterrows():
+        group = scored[scored["race_id"] == key["race_id"]].copy()
+        by_model = _rank(group, "model_p")
+        by_value = _rank(group, "value")
+        by_market = _rank(group, "market_p")
+        spik = by_model.iloc[0]
+        reserves = by_model.iloc[1:3]
+        contenders = by_model.head(3)
+        value_pick = _rank(contenders, "value").iloc[0]
+        market_pick = by_market.iloc[0]
+        spik_value = _num(spik["value"], 6) or 0.0
+        value_value = _num(value_pick["value"], 6)
+        gardera = (
+            int(value_pick["start_number"]) != int(spik["start_number"])
+            and value_value is not None
+            and spik_value > 0
+            and value_value >= spik_value * VALUE_EDGE
+        )
+        second = by_model.iloc[1] if len(by_model) > 1 else None
+        spik_p = float(spik["model_p"])
+        second_p = float(second["model_p"]) if second is not None else 0.0
+        bank = second is None or (second_p > 0 and spik_p >= second_p * 1.75) or (
+            second_p == 0 and spik_p > 0
+        )
+        group_numbers = [int(spik["start_number"])]
+        if gardera:
+            group_numbers.append(int(value_pick["start_number"]))
+        spik_numbers.append([int(spik["start_number"])])
+        value_numbers.append(int(value_pick["start_number"]))
+        market_numbers.append(int(market_pick["start_number"]))
+        system_groups.append(group_numbers)
+        head = group.iloc[0]
+        legs.append(
+            {
+                "leg": int(key["leg"]),
+                "race_id": head["race_id"],
+                "race_name": head.get("race_name") or "",
+                "track_name": head.get("track_name") or "",
+                "distance": _num(head.get("distance"), 0),
+                "start_method": head.get("start_method") or "",
+                "field_size": int(head["field_size"]),
+                "bank": bool(bank),
+                "gardering": gardera,
+                "spik": _horse_bits(spik),
+                "reserves": [_horse_bits(row) for _, row in reserves.iterrows()],
+                "value_pick": _horse_bits(value_pick),
+                "market_pick": _horse_bits(market_pick),
+                "by_model_p": [_horse_bits(row) for _, row in by_model.head(5).iterrows()],
+                "by_value": [_horse_bits(row) for _, row in by_value.head(3).iterrows()],
+            }
+        )
+
+    expanded = list(product(*system_groups))
+    return {
+        "legs": legs,
+        "enkelrad": _coupon(spik_numbers),
+        "value_rad": "-".join(str(number) for number in value_numbers),
+        "marknad_rad": "-".join(str(number) for number in market_numbers),
+        "system_notation": _coupon(system_groups),
+        "system_rows": ["-".join(str(number) for number in row) for row in expanded],
+        "n_system_rows": len(expanded),
+    }
+
+
+def render_report(
+    *,
+    hit_date: str,
+    game_type: str,
+    game_id: str,
+    status: str,
+    start_time: str | None,
+    track: str,
+    metrics: dict,
+    n_full: int,
+    n_hist_horses: int,
+    n_starters: int,
+    suggestion: dict,
+    paths: dict[str, Path],
+) -> str:
+    lines = [
+        DISCLAIMER,
+        "",
+        f"Spel: {game_type}  {game_id}",
+        f"Dag: {hit_date}   Status: {status or '–'}   Bana: {track or '–'}",
+        f"Start: {start_time or '–'}   Avdelningar: {len(suggestion['legs'])}",
+        (
+            f"Modell: HistGradientBoosting tränad på {n_full} historiska starter "
+            f"({OUT.name})."
+        ),
+        (
+            f"Tidsplit-test (före {metrics.get('cut_date')} / från {metrics.get('cut_date')}): "
+            f"log-loss {_fmt(metrics.get('log_loss'), '.4f')}, "
+            f"Brier {_fmt(metrics.get('brier'), '.4f')}, "
+            f"AUC {_fmt(metrics.get('roc_auc'), '.4f')}, "
+            f"top-1 modell {metrics.get('top1_model_count')}/{metrics.get('n_races')} "
+            f"= {_fmt(metrics.get('top1_model'), '.1%')}, "
+            f"marknadsfavorit {metrics.get('top1_market_count')}/{metrics.get('n_races')} "
+            f"= {_fmt(metrics.get('top1_market'), '.1%')}."
+        ),
+        (
+            f"Tränarbyte och distansform slås upp i stickprovet: "
+            f"{n_hist_horses} av {n_starters} starter är hästar som finns där. "
+            "Saknas hästen blir tränarbyte=0 och distansform tas från rekordet i distansklassen."
+        ),
+        "marknad = normaliserad 1/vinnarodds. value = model_p / marknad.",
+        "",
+        "════════════════════════════════════════",
+        "ENKEL VINNARRAD  (högst model_p per avdelning)",
+        "════════════════════════════════════════",
+        suggestion["enkelrad"],
+    ]
+    for leg in suggestion["legs"]:
+        spik = leg["spik"]
+        role = "spik" if leg["bank"] else "öppen"
+        lines.append(
+            f"Avd {leg['leg']}  #{spik['start_number']} {spik['horse_name']}  "
+            f"model_p={spik['model_p']:.3f}  marknad={_fmt(spik['market_p'], '.3f')}  "
+            f"value={_fmt(spik['value'], '.2f')}  "
+            f"tränarbyte={spik['trainer_change']}  "
+            f"distansform={_fmt(spik['distance_form'], '.3f')}  ({role})"
+        )
+
+    lines += [
+        "",
+        "════════════════════════════════════════",
+        "PER AVDELNING",
+        "════════════════════════════════════════",
+    ]
+    for leg in suggestion["legs"]:
+        distance = leg["distance"]
+        distance_s = str(int(distance)) if distance is not None else "–"
+        lines.append(
+            f"Avd {leg['leg']}  {leg['track_name']}  {distance_s} m  "
+            f"{leg['start_method']}  {leg['field_size']} startande"
+        )
+        if leg["race_name"]:
+            lines.append(f"  {leg['race_name']}")
+        lines.append("  Rankad på model_p")
+        for rank, horse in enumerate(leg["by_model_p"], start=1):
+            lines.append(_line_from_bits(rank, horse))
+        lines.append("  Rankad på value")
+        for rank, horse in enumerate(leg["by_value"], start=1):
+            lines.append(_line_from_bits(rank, horse))
+        reserves = leg["reserves"]
+        if reserves:
+            names = ", ".join(
+                f"#{horse['start_number']} {horse['horse_name']}" for horse in reserves
+            )
+            lines.append(f"  Reserv: {names}")
+        lines.append("")
+
+    lines += [
+        "════════════════════════════════════════",
+        "SYSTEM  (favoriter + value)",
+        "════════════════════════════════════════",
+        f"Rad A  modellfavorit:  {suggestion['enkelrad']}",
+        (
+            f"Rad B  value (bästa value bland topp-3 model_p):  "
+            f"{suggestion['value_rad']}"
+        ),
+        f"Rad C  spelfavorit (marknad):  {suggestion['marknad_rad']}",
+        (
+            f"Gardering: value-hästen läggs till där den skiljer sig och value är "
+            f">= {VALUE_EDGE:.2f} × spikens value."
+        ),
+        f"System: {suggestion['system_notation']}   ({suggestion['n_system_rows']} rader)",
+    ]
+    rows = suggestion["system_rows"]
+    if suggestion["n_system_rows"] <= 16:
+        for index, row in enumerate(rows, start=1):
+            lines.append(f"  {index:>2}. {row}")
+    else:
+        lines.append("  För många rader att lista var för sig — använd notationen ovan.")
+    lines += [
+        "",
+        "Filer:",
+        f"  {paths['starters']}",
+        f"  {paths['game']}",
+        f"  {paths['calendar']}",
+        f"  {paths['text']}",
+        f"  {paths['json']}",
+        "",
+        DISCLAIMER,
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _line_from_bits(rank: int, horse: dict) -> str:
+    change = horse["trainer_change"]
+    change_s = "–" if change is None else str(change)
+    return (
+        f"  {rank:>2}. #{horse['start_number']:<2} {str(horse['horse_name']):<22} "
+        f"model_p={_fmt(horse['model_p'], '.3f')}  "
+        f"marknad={_fmt(horse['market_p'], '.3f')}  "
+        f"value={_fmt(horse['value'], '.2f')}  "
+        f"tränarbyte={change_s}  "
+        f"distansform={_fmt(horse['distance_form'], '.3f')}"
+    )
+
+
+def render_no_game(start: str, days: int, discovered) -> str:
+    lines = [
+        DISCLAIMER,
+        "",
+        f"Ingen spelbar V75/V85 med publicerad startlista mellan {start} och {days - 1} dagar framåt.",
+    ]
+    if discovered.placeholders:
+        first = discovered.placeholders[0]
+        lines.append(
+            f"Närmaste platshållare: {first['game_type']} {first['date']} "
+            f"(status {first['status']}, inget spel-id ännu)."
+        )
+    if discovered.errors:
+        lines.append("Kalenderfel:")
+        lines.extend(f"  {err}" for err in discovered.errors)
+    lines += ["", DISCLAIMER]
+    return "\n".join(lines) + "\n"
+
+
+def _parse_date(text: str):
+    return datetime.strptime(text, "%Y-%m-%d").date()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Hämta nästa V75/V85 och skriv en föreslagen vinnarrad. Lägger inga spel."
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=14,
+        help="Antal dagar framåt från startdatum, inklusive idag (standard 14).",
+    )
+    parser.add_argument(
+        "--date",
+        default=None,
+        help="Startdatum YYYY-MM-DD. Standard är idag i Europe/Stockholm.",
+    )
+    args = parser.parse_args(argv)
+    if args.days < 1:
+        print("days måste vara minst 1", file=sys.stderr)
+        return 2
+
+    start = _parse_date(args.date) if args.date else stockholm_today()
+    print(
+        f"Söker V75/V85 från {start.isoformat()} och {args.days - 1} dagar framåt "
+        "(Europe/Stockholm). Hämtar kalender med paus mellan anrop…"
+    )
+    discovered = discover_vgame(start, days=args.days)
+    LIVE_DIR.mkdir(parents=True, exist_ok=True)
+    text_path = LIVE_DIR / "suggested_rows.txt"
+    json_path = LIVE_DIR / "suggested_rows.json"
+
+    if discovered.hit is None:
+        report = render_no_game(start.isoformat(), args.days, discovered)
+        text_path.write_text(report, encoding="utf-8")
+        json_path.write_text(
+            json.dumps(
+                {
+                    "disclaimer": DISCLAIMER,
+                    "found": False,
+                    "start": start.isoformat(),
+                    "days": args.days,
+                    "placeholders": discovered.placeholders,
+                    "errors": discovered.errors,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print(report, end="")
+        return 0
+
+    hit = discovered.hit
+    print(f"Hittade {hit.game_type} {hit.game_id} ({hit.status}). Hämtar spelomgång…")
+    try:
+        game = fetch_game(hit.game_id)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        print(f"Kunde inte hämta {hit.game_id}: {exc}", file=sys.stderr)
+        return 1
+
+    rows = rows_from_game(game, hit.game_type, require_results=False)
+    if not rows:
+        print(f"{hit.game_id} saknar starter.", file=sys.stderr)
+        return 1
+    if not OUT.exists():
+        print(f"Saknar historik: {OUT}", file=sys.stderr)
+        return 1
+
+    history = history_from_csv(OUT)
+    known = {
+        norm_id(row.get("horse_id"))
+        for row in rows
+        if norm_id(row.get("horse_id")) in history
+    }
+    apply_history(rows, extra_events=history)
+    paths = save_live_payloads(hit, game, rows)
+    paths["text"] = text_path
+    paths["json"] = json_path
+
+    print("Tränar modell på historiska starter…")
+    evaluation = run_mvp(OUT)
+    historical = load_starters(OUT)
+    fitted = fit_full(historical)
+    scored = score_starters(fitted, pd.DataFrame(rows))
+    suggestion = build_suggestion(scored)
+    track = next((row.get("track_name") for row in rows if row.get("track_name")), "")
+    n_hist = sum(1 for row in rows if norm_id(row.get("horse_id")) in known)
+    report = render_report(
+        hit_date=hit.date,
+        game_type=hit.game_type,
+        game_id=hit.game_id,
+        status=game.get("status") or hit.status,
+        start_time=hit.start_time,
+        track=track,
+        metrics=evaluation.metrics,
+        n_full=fitted.n_rows,
+        n_hist_horses=n_hist,
+        n_starters=len(rows),
+        suggestion=suggestion,
+        paths=paths,
+    )
+    text_path.write_text(report, encoding="utf-8")
+    payload = {
+        "disclaimer": DISCLAIMER,
+        "found": True,
+        "generated_at": datetime.now(STOCKHOLM).isoformat(timespec="seconds"),
+        "game_type": hit.game_type,
+        "game_id": hit.game_id,
+        "date": hit.date,
+        "status": game.get("status") or hit.status,
+        "start_time": hit.start_time,
+        "track_name": track,
+        "trained_on_rows": fitted.n_rows,
+        "evaluation": evaluation.metrics,
+        "starters_with_history": n_hist,
+        "starters": len(rows),
+        "enkelrad": suggestion["enkelrad"],
+        "value_rad": suggestion["value_rad"],
+        "marknad_rad": suggestion["marknad_rad"],
+        "system_notation": suggestion["system_notation"],
+        "n_system_rows": suggestion["n_system_rows"],
+        "system_rows": suggestion["system_rows"],
+        "legs": suggestion["legs"],
+        "files": {name: str(path) for name, path in paths.items()},
+    }
+    json_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    print(report, end="")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
