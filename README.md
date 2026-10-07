@@ -2,7 +2,7 @@
 
 Personligt forskningsprojekt: historisk svensk travdata → vinstsannolikheter per häst, med fokus på **tränarbyte**, **distansbetingad form** och **marknadsprissättning**.
 
-> **Ansvar:** Travspel är slumpmässigt och riskfyllt. Detta är ett tekniskt MVP, inte speltips och inte finansiell rådgivning. Respektera ATG:s användarvillkor. **Robotspel** (automatiserad systemoptimering mot andras kuponger) är förbjudet av ATG.
+> **Ansvar — läs detta.** Detta är ett personligt analysverktyg, inte finansiell rådgivning och inte speltips. Travspel är slumpmässigt och riskfyllt. **Placera inga spel automatiskt.** ATG förbjuder **robotspel** (automatiserad kupongoptimering mot andra spelares kuponger). Skripten hämtar bara publik racinginfo-JSON och skriver ett textförslag.
 
 ## Snabbstart
 
@@ -10,11 +10,15 @@ Personligt forskningsprojekt: historisk svensk travdata → vinstsannolikheter p
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python scripts/train_mvp.py
+# nästa V75/V85: hämta live-data, träna, skriv vinnarrad
+python scripts/predict_live.py
 # grafiskt gränssnitt
 streamlit run scripts/gui.py
 # valfritt: hämta om stickprovet
 # python scripts/fetch_atg_sample.py
 ```
+
+`predict_live.py` tittar upp till 14 dagar framåt från idag (Europe/Stockholm), tar dagens V75/V85 om den fortfarande är spelbar, annars nästa publicerade omgång. Den sparar startlista och rå-JSON under `data/live/`, tränar på `data/atg_starters_sample.csv` och skriver enkelrad plus ett litet system till stdout och `data/live/suggested_rows.txt`. Minst 0,4 s mellan varje HTTP-anrop. Inga kuponger skickas till ATG.
 
 ## V75 vs V85 (struktur, okt 2026)
 
@@ -126,9 +130,11 @@ trav-mvp/
   .gitignore
   data/atg_starters_sample.csv   # riktigt ATG-stickprov (~1500 starter, V75+V85)
   data/*.json                    # exempel-payloads (kan ignoreras i git)
-  scripts/fetch_atg_sample.py    # omhämta stickprov
+  data/live/                     # skapas av predict_live.py (gitignorerad)
+  scripts/fetch_atg_sample.py    # racinginfo-hämtning, delas med live
   scripts/mvp_core.py            # delad träningskärna
   scripts/train_mvp.py           # CLI: träna + metriker + toppickar
+  scripts/predict_live.py        # nästa V75/V85 → föreslagen rad
   scripts/gui.py                 # Streamlit-gränssnitt
 ```
 

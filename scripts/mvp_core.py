@@ -59,15 +59,33 @@ def load_starters(path: Path | None = None) -> pd.DataFrame:
     return df.sort_values(["date", "race_id", "start_number"]).reset_index(drop=True)
 
 
-def prepare_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+def new_classifier() -> HistGradientBoostingClassifier:
+    return HistGradientBoostingClassifier(
+        max_depth=4,
+        learning_rate=0.08,
+        max_iter=200,
+        l2_regularization=0.1,
+        random_state=42,
+    )
+
+
+def feature_matrix(
+    df: pd.DataFrame, medians: pd.Series | None = None
+) -> tuple[pd.DataFrame, pd.Series]:
     work = df.copy()
     for c in FEATURES:
         if c not in work.columns:
             work[c] = np.nan
         work[c] = pd.to_numeric(work[c], errors="coerce")
-    med = work[FEATURES].median(numeric_only=True)
-    X = work[FEATURES].fillna(med).fillna(0.0)
-    y = work["won"].astype(int)
+    if medians is None:
+        medians = work[FEATURES].median(numeric_only=True)
+    X = work[FEATURES].fillna(medians).fillna(0.0)
+    return X, medians
+
+
+def prepare_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+    X, _medians = feature_matrix(df)
+    y = df["won"].astype(int)
     return X, y
 
 
@@ -93,13 +111,7 @@ def run_mvp(path: Path | None = None) -> MvpResult:
     Xte, yte = X[test_mask], y[test_mask]
     df_te = df[test_mask].copy()
 
-    clf = HistGradientBoostingClassifier(
-        max_depth=4,
-        learning_rate=0.08,
-        max_iter=200,
-        l2_regularization=0.1,
-        random_state=42,
-    )
+    clf = new_classifier()
     clf.fit(Xtr, ytr)
     proba = clf.predict_proba(Xte)[:, 1]
     pred = (proba >= 0.5).astype(int)
@@ -180,6 +192,48 @@ def run_mvp(path: Path | None = None) -> MvpResult:
         feature_importance=fi,
         race_picks=race_picks,
     )
+
+
+@dataclass
+class FittedMvp:
+    """Modell tränad på hela historiken, för att poängsätta en kommande omgång."""
+
+    clf: HistGradientBoostingClassifier
+    medians: pd.Series
+    n_rows: int
+
+
+def fit_full(df: pd.DataFrame) -> FittedMvp:
+    """Träna på alla rader med känd vinst (live-scoring, inte tidsplit)."""
+    trainable = df.dropna(subset=["won"]).copy()
+    trainable["won"] = trainable["won"].astype(int)
+    X, medians = feature_matrix(trainable)
+    clf = new_classifier()
+    clf.fit(X, trainable["won"].astype(int))
+    return FittedMvp(clf=clf, medians=medians, n_rows=int(len(trainable)))
+
+
+def score_starters(fitted: FittedMvp, df: pd.DataFrame) -> pd.DataFrame:
+    """Lägg på model_p, market_p och value = model_p / market_p.
+
+    market_p är normaliserad 1/vinnarodds. Saknas den används poolandelen.
+    """
+    out = df.copy()
+    X, _medians = feature_matrix(out, fitted.medians)
+    out["model_p"] = fitted.clf.predict_proba(X)[:, 1]
+    if "market_implied_prob" in out.columns:
+        market = pd.to_numeric(out["market_implied_prob"], errors="coerce")
+    else:
+        market = pd.Series(np.nan, index=out.index)
+    if "market_share_pool" in out.columns:
+        pool = pd.to_numeric(out["market_share_pool"], errors="coerce")
+        market = market.where(market.notna() & (market > 0), pool)
+    else:
+        market = market.where(market > 0)
+    market = market.replace(0, np.nan)
+    out["market_p"] = market
+    out["value"] = out["model_p"] / market
+    return out
 
 
 def race_detail(result: MvpResult, race_id: str) -> pd.DataFrame:
