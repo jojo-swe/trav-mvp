@@ -10,6 +10,8 @@ Personligt forskningsprojekt: historisk svensk travdata → vinstsannolikheter p
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python scripts/train_mvp.py
+# grafiskt gränssnitt
+streamlit run scripts/gui.py
 # valfritt: hämta om stickprovet
 # python scripts/fetch_atg_sample.py
 ```
@@ -125,7 +127,9 @@ trav-mvp/
   data/atg_starters_sample.csv   # riktigt ATG-stickprov (~1500 starter, V75+V85)
   data/*.json                    # exempel-payloads (kan ignoreras i git)
   scripts/fetch_atg_sample.py    # omhämta stickprov
-  scripts/train_mvp.py           # träna + metriker + toppickar
+  scripts/mvp_core.py            # delad träningskärna
+  scripts/train_mvp.py           # CLI: träna + metriker + toppickar
+  scripts/gui.py                 # Streamlit-gränssnitt
 ```
 
 ### Körresultat (körning 2026-10-07, Europe/Stockholm)
