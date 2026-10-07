@@ -146,17 +146,29 @@ trav-mvp/
 
 ### Körresultat (körning 2026-10-07, Europe/Stockholm)
 
-Stickprov: **1574 starter**, 146 lopp (V75+V85+några V64), tidsplit train &lt; 2025-11-15 / test ≥ 2025-11-15.
+Historik: **68 156 starter**, 7 079 svenska travlopp, 10 335 hästar, 2025-10-10 … 2026-10-07. Tidsplit train &lt; 2026-07-20 / test ≥ 2026-07-20 (50 932 / 17 224 starter).
 
 | Metrik | Värde |
 |--------|-------|
-| Log-loss | **0.2662** |
-| Brier | **0.0684** |
-| ROC-AUC | **0.8247** |
-| Top-1 (modell) | 15/40 = **37.5%** |
-| Top-1 (marknadsfavorit) | 19/40 = **47.5%** |
+| Log-loss | **0.2479** |
+| Brier | **0.0734** |
+| ROC-AUC | **0.8513** |
+| Top-1 (modell) | 768/1779 = **43.2%** |
+| Top-1 (marknadsfavorit) | 765/1779 = **43.0%** |
 
-Marknaden är ett starkt baseline på detta lilla stickprov — modellens jobb i nästa steg är **value** (slå poolen), inte bara tipsa favoriten. Features inkluderar `trainer_change`, `distance_form`, `market_implied_prob`, `market_share_pool`.
+Det tidigare V-omgångsstickprovet (1 574 starter) gav AUC 0.8247 men täckte bara ~33/99 hästar på live-V85. På den utökade historiken ligger modellens top-1 i linje med marknaden.
+
+Live **V85 Solvalla 2026-10-10** (`V85_2026-10-10_5_6`, spelbar):
+
+| | |
+|--|--|
+| Historik | **99/99 (100%)** har minst en tidigare start |
+| Distansform från starter | **98/99 (99%)** |
+| Enkelrad (model_p) | **1-9-11-1-2-6-4-2** |
+| Value (topp-3) | 1-8-7-14-2-6-5-2 |
+| Marknad | 1-9-11-1-2-6-4-2 |
+
+Tränarbyte är beräknat mot senaste tidigare start (ett byte på kortet: avd 2 #1 Charron). Ace Wibb (avd 4 #14) har 14 tidigare starter men ingen på lång distans, så distansform lämnas tom i stället för ett påhittat värde. `market_share_pool` i historikfilen faller tillbaka till implicerad vinnarsannolikhet när lopp-JSON saknar V-poolens `betDistribution`; live-raden använder publicerad poolandel. Historiska `finalOdds` är stängningsodds. Inga spel läggs.
 
 ### Nästa steg mot produktion
 
