@@ -19,6 +19,7 @@ from datetime import datetime
 from itertools import product
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -42,6 +43,8 @@ from fetch_atg_sample import (  # noqa: E402
     stockholm_today,
 )
 from mvp_core import fit_full, load_starters, run_mvp, score_starters  # noqa: E402
+from news_signal import gather_news  # noqa: E402
+from decision_layer import RowCandidate, decide  # noqa: E402
 
 DISCLAIMER = (
     "Personlig analys, inte finansiell rådgivning och inte speltips. "
@@ -188,6 +191,30 @@ def build_suggestion(scored: pd.DataFrame) -> dict:
     }
 
 
+def apply_news_adjustments(scored: pd.DataFrame, adjustments: dict[str, float]) -> pd.DataFrame:
+    """Vikta om model_p med nyhetsjusteringar innan rankning/system.
+
+    Multiplicerar matchande hästars model_p med sin justeringsfaktor, sedan
+    renormaliserar inom avdelningen så att totalsumman per avdelning är
+    oförändrad (vi vill omfördela sannolikhet mellan hästar, inte låtsas
+    att modellen blivit mer eller mindre säker totalt sett). value räknas
+    om efter justeringen.
+    """
+    if not adjustments:
+        return scored
+    out = scored.copy()
+    factor = out["horse_name"].map(adjustments).fillna(1.0)
+    pre = out["model_p"].astype(float)
+    adjusted = pre * factor
+    sum_pre = pre.groupby(out["race_id"]).transform("sum")
+    sum_adj = adjusted.groupby(out["race_id"]).transform("sum")
+    scale = (sum_pre / sum_adj.replace(0, np.nan)).fillna(1.0)
+    out["model_p"] = adjusted * scale
+    market = pd.to_numeric(out["market_p"], errors="coerce")
+    out["value"] = out["model_p"] / market
+    return out
+
+
 def rank_candidate_rows(scored: pd.DataFrame, max_rows: int = 50, per_leg: int = 4) -> dict:
     """Full ranked lista över kandidatrader, bäst till sämst — inte bara en kollapsad rad.
 
@@ -285,6 +312,8 @@ def render_report(
     n_starters: int,
     suggestion: dict,
     ranked: dict,
+    news,
+    decision,
     paths: dict[str, Path],
 ) -> str:
     lines = [
@@ -382,6 +411,29 @@ def render_report(
         )
     if ranked["n_rows_returned"] > 30:
         lines.append(f"  … {ranked['n_rows_returned'] - 30} fler rader i suggested_rows.json (ranked_rows).")
+
+    lines += [
+        "",
+        "════════════════════════════════════════",
+        "NYHETER  (sökning innan scoring)",
+        "════════════════════════════════════════",
+        news.note or "(ingen notering)",
+    ]
+    if news.flags:
+        lines.append("Flaggor (kontrollera ATG:s startlista innan ev. spel):")
+        lines.extend(f"  - {flag}" for flag in news.flags)
+    else:
+        lines.append("Inga skade-/strykningsflaggor hittade i sökningen.")
+
+    lines += [
+        "",
+        "════════════════════════════════════════",
+        "BESLUT  (typad sammanfattning av topp-raden)",
+        "════════════════════════════════════════",
+        f"Säkerhet: {decision.confidence}   Källa: {decision.source}",
+        decision.headline,
+        decision.rationale,
+    ]
 
     lines += [
         "",
@@ -485,6 +537,17 @@ def main(argv: list[str] | None = None) -> int:
         default=4,
         help="Hur många topphästar (på model_p) per avdelning som ingår i rankningen (standard 4).",
     )
+    parser.add_argument(
+        "--no-news",
+        action="store_true",
+        help="Hoppa över nyhetsinhämtningen (ingen nätsökning efter skador/strykningar).",
+    )
+    parser.add_argument(
+        "--max-news-queries",
+        type=int,
+        default=12,
+        help="Max antal nyhetssökningar per körning (standard 12).",
+    )
     args = parser.parse_args(argv)
     if args.days < 1:
         print("days måste vara minst 1", file=sys.stderr)
@@ -548,15 +611,36 @@ def main(argv: list[str] | None = None) -> int:
     paths = save_live_payloads(hit, game, rows)
     paths["text"] = text_path
     paths["json"] = json_path
+    track = next((row.get("track_name") for row in rows if row.get("track_name")), "")
+
+    print("Söker trav-nyheter (skador/strykningar/form)…")
+    news = gather_news(
+        track_name=track,
+        horse_names=sorted({r.get("horse_name") for r in rows if r.get("horse_name")}),
+        driver_names=sorted({r.get("driver_name") for r in rows if r.get("driver_name")}),
+        trainer_names=sorted({r.get("trainer_name") for r in rows if r.get("trainer_name")}),
+        max_entity_queries=args.max_news_queries,
+        enabled=not args.no_news,
+    )
+    print(f"  {news.note or ('nyhetssteg avstängt' if not news.queried else 'klart')}")
 
     print("Tränar modell på historiska starter…")
     evaluation = run_mvp(HISTORY_CSV)
     historical = load_starters(HISTORY_CSV)
     fitted = fit_full(historical)
     scored = score_starters(fitted, pd.DataFrame(rows))
+    scored = apply_news_adjustments(scored, news.adjustments)
     suggestion = build_suggestion(scored)
     ranked = rank_candidate_rows(scored, max_rows=args.max_rows, per_leg=args.candidates_per_leg)
-    track = next((row.get("track_name") for row in rows if row.get("track_name")), "")
+    legs_open = sum(1 for leg in suggestion["legs"] if not leg["bank"])
+    decision = decide(
+        [
+            RowCandidate(rank=r["rank"], coupon=r["coupon"], combined_probability=r["combined_probability"])
+            for r in ranked["rows"]
+        ],
+        legs_open=legs_open,
+        news_flags=tuple(news.flags),
+    )
     n_hist = sum(1 for row in rows if (row.get("prior_starts") or 0) > 0)
     n_dist = sum(1 for row in rows if (row.get("distance_starts_prior") or 0) > 0)
     report = render_report(
@@ -573,6 +657,8 @@ def main(argv: list[str] | None = None) -> int:
         n_starters=len(rows),
         suggestion=suggestion,
         ranked=ranked,
+        news=news,
+        decision=decision,
         paths=paths,
     )
     text_path.write_text(report, encoding="utf-8")
@@ -605,6 +691,20 @@ def main(argv: list[str] | None = None) -> int:
             "candidates_per_leg": ranked["candidates_per_leg"],
             "total_candidate_space": ranked["total_candidate_space"],
             "n_rows_returned": ranked["n_rows_returned"],
+        },
+        "news": {
+            "queried": news.queried,
+            "note": news.note,
+            "flags": list(news.flags),
+            "adjustments": news.adjustments,
+            "n_items_found": len(news.items),
+        },
+        "decision": {
+            "confidence": decision.confidence,
+            "headline": decision.headline,
+            "rationale": decision.rationale,
+            "risk_flags": list(decision.risk_flags),
+            "source": decision.source,
         },
         "legs": suggestion["legs"],
         "files": {name: str(path) for name, path in paths.items()},

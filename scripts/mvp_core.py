@@ -25,6 +25,7 @@ FEATURES = [
     "market_implied_prob",
     "market_share_pool",
     "post_position",
+    "post_position_share",
     "field_size",
     "distance",
     "life_win_pct",
@@ -36,7 +37,61 @@ FEATURES = [
     "driver_win_pct_ytd",
     "horse_age",
     "shoe_changed",
+    "sulky_changed",
+    "driver_change",
+    "track_condition_code",
+    "sex_mare",
+    "sex_stallion",
+    "sex_gelding",
 ]
+
+# Fast = hårt underlag, Heavy/Soft = tungt. Siffran är en grov ordinal skala
+# (lägre = snabbare bana) så trädmodellen får ett meningsfullt numeriskt
+# samband snarare än en godtycklig kategorikod. Okänt värde -> median vid
+# fit-time (samma fallback som övriga features), INTE en ny kategori, så
+# kodningen är identisk mellan träning och live-scoring.
+TRACK_CONDITION_CODE = {
+    "fast": 0,
+    "firm": 0,
+    "good": 1,
+    "normal": 1,
+    "light": 1,
+    "yielding": 2,
+    "soft": 2,
+    "heavy": 3,
+    "muddy": 3,
+    "slow": 3,
+}
+
+_BOOL_TRUE = {"true", "1", "1.0", "yes", "ja"}
+_BOOL_FALSE = {"false", "0", "0.0", "no", "nej"}
+
+
+def _coerce_bool(series: pd.Series) -> pd.Series:
+    """CSV skriver Python-bools som strängarna "True"/"False".
+
+    pd.to_numeric(..., errors="coerce") gör NaN av dem (bugg som gjorde att
+    shoe_changed/sulky_changed i praktiken alltid blev 0 tidigare). Mappa
+    explicit till 1/0 innan vi faller tillbaka på to_numeric för riktiga
+    bool-/numeriska värden.
+    """
+
+    def _one(value):
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        if pd.isna(value):
+            return np.nan
+        text = str(value).strip().lower()
+        if text in _BOOL_TRUE:
+            return 1.0
+        if text in _BOOL_FALSE:
+            return 0.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return np.nan
+
+    return series.map(_one)
 
 
 @dataclass
@@ -69,14 +124,57 @@ def new_classifier() -> HistGradientBoostingClassifier:
     )
 
 
+def _derive_engineered_columns(work: pd.DataFrame) -> pd.DataFrame:
+    """Härled kolumner som inte finns rakt av i CSV:n, deterministiskt och
+    identiskt vid träning och live-scoring (inga per-batch kategorikoder)."""
+    if "post_position" in work.columns and "field_size" in work.columns:
+        pos = pd.to_numeric(work["post_position"], errors="coerce")
+        size = pd.to_numeric(work["field_size"], errors="coerce").replace(0, np.nan)
+        work["post_position_share"] = pos / size
+    else:
+        work["post_position_share"] = np.nan
+
+    for col in ("shoe_changed", "sulky_changed"):
+        if col in work.columns:
+            work[col] = _coerce_bool(work[col])
+        else:
+            work[col] = np.nan
+
+    if "driver_change" not in work.columns:
+        work["driver_change"] = np.nan
+
+    if "track_condition" in work.columns:
+        work["track_condition_code"] = (
+            work["track_condition"].astype(str).str.strip().str.lower().map(TRACK_CONDITION_CODE)
+        )
+    else:
+        work["track_condition_code"] = np.nan
+
+    if "horse_sex" in work.columns:
+        sex = work["horse_sex"].astype(str).str.strip().str.lower()
+        work["sex_mare"] = (sex == "mare").astype(float)
+        work["sex_stallion"] = (sex == "stallion").astype(float)
+        work["sex_gelding"] = (sex == "gelding").astype(float)
+        unknown = ~sex.isin({"mare", "stallion", "gelding"})
+        for col in ("sex_mare", "sex_stallion", "sex_gelding"):
+            work.loc[unknown, col] = np.nan
+    else:
+        work["sex_mare"] = np.nan
+        work["sex_stallion"] = np.nan
+        work["sex_gelding"] = np.nan
+    return work
+
+
 def feature_matrix(
     df: pd.DataFrame, medians: pd.Series | None = None
 ) -> tuple[pd.DataFrame, pd.Series]:
     work = df.copy()
+    work = _derive_engineered_columns(work)
     for c in FEATURES:
         if c not in work.columns:
             work[c] = np.nan
-        work[c] = pd.to_numeric(work[c], errors="coerce")
+        if c not in ("shoe_changed", "sulky_changed", "sex_mare", "sex_stallion", "sex_gelding"):
+            work[c] = pd.to_numeric(work[c], errors="coerce")
     if medians is None:
         medians = work[FEATURES].median(numeric_only=True)
     X = work[FEATURES].fillna(medians).fillna(0.0)

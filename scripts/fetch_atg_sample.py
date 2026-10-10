@@ -224,6 +224,7 @@ def _event_from_row(row: dict) -> tuple:
         _place(row.get("place")),
         row.get("final_odds"),
         str(row.get("race_id") or ""),
+        norm_id(row.get("driver_id")),
     )
 
 
@@ -443,6 +444,11 @@ def apply_history(rows: list[dict], extra_events: dict[str, list[tuple]] | None 
             row["trainer_change"] = (
                 1 if last_trainer and current and last_trainer != current else 0
             )
+            last_driver = prev[-1][7] if len(prev[-1]) > 7 else None
+            current_driver = norm_id(row.get("driver_id"))
+            row["driver_change"] = (
+                1 if last_driver and current_driver and last_driver != current_driver else 0
+            )
             same = [item for item in prev if item[3] == row.get("distance_class")][-5:]
             same_places = [item[4] for item in same if item[4]]
             if same_places:
@@ -462,6 +468,7 @@ def apply_history(rows: list[dict], extra_events: dict[str, list[tuple]] | None 
             )
         else:
             row["trainer_change"] = 0
+            row["driver_change"] = 0
             row["distance_starts_prior"] = 0
             row["recent_form"] = None
             row["distance_form_source"] = "record" if row.get("distance_form") else "none"
@@ -494,6 +501,7 @@ PREFERRED_FIELDS = [
     "trainer_change",
     "driver_id",
     "driver_name",
+    "driver_change",
     "place",
     "won",
     "final_odds",
