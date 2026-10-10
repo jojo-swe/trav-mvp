@@ -10,3 +10,4 @@ data/*.json
 data/live/
 data/history/
 data/raw/
+data/calibration_history.jsonl

@@ -191,6 +191,77 @@ def build_suggestion(scored: pd.DataFrame) -> dict:
     }
 
 
+CALIBRATION_HISTORY = LIVE_DIR.parent / "calibration_history.jsonl"
+
+
+def track_calibration_history(
+    metrics: dict, history_path: Path = CALIBRATION_HISTORY, trailing_n: int = 10
+) -> dict:
+    """Logga denna körnings tidsplit-holdout-mått och flagga drift mot trenden.
+
+    Det här är prediktion-mot-utfall-återkopplingsloopen i sin enkla form:
+    run_mvp()'s tidsplit-holdout ÄR "de senast avslutade loppen modellen inte
+    tränats på", så varje körnings log-loss/Brier/ECE mot den holdouten är
+    redan en prediktion-vs-utfall-jämförelse. Vi loggar den till en
+    append-only jsonl-historik och jämför mot ett rullande snitt av de
+    senaste `trailing_n` körningarna. Ingen automatisk omträning/
+    hyperparameterjustering triggas av detta — det är en varningssignal för
+    en människa (synlig i rapporten), inte ett stängt styrsystem.
+    """
+    record = {
+        "timestamp": datetime.now(STOCKHOLM).isoformat(timespec="seconds"),
+        "cut_date": metrics.get("cut_date"),
+        "n_total": metrics.get("n_total"),
+        "n_train": metrics.get("n_train"),
+        "n_test": metrics.get("n_test"),
+        "log_loss": metrics.get("log_loss"),
+        "brier": metrics.get("brier"),
+        "calibrated_log_loss": metrics.get("calibrated_log_loss"),
+        "calibrated_brier": metrics.get("calibrated_brier"),
+        "calibration_ece": metrics.get("calibration_ece"),
+        "roc_auc": metrics.get("roc_auc"),
+        "top1_model": metrics.get("top1_model"),
+        "top1_market": metrics.get("top1_market"),
+    }
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    previous = []
+    if history_path.exists():
+        for line in history_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                previous.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    with history_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    trailing = previous[-trailing_n:]
+    if len(trailing) < 5:
+        return {
+            "status": "otillrackligt_historik",
+            "detail": f"{len(trailing)} tidigare körningar loggade (behöver minst 5 för drifttrend).",
+            "n_history": len(previous) + 1,
+        }
+    ll_values = [r["calibrated_log_loss"] for r in trailing if r.get("calibrated_log_loss") is not None]
+    brier_values = [r["calibrated_brier"] for r in trailing if r.get("calibrated_brier") is not None]
+    avg_ll = sum(ll_values) / len(ll_values) if ll_values else None
+    avg_brier = sum(brier_values) / len(brier_values) if brier_values else None
+    cur_ll = record["calibrated_log_loss"]
+    cur_brier = record["calibrated_brier"]
+    worse_ll = cur_ll is not None and avg_ll and cur_ll > avg_ll * 1.15
+    worse_brier = cur_brier is not None and avg_brier and cur_brier > avg_brier * 1.15
+    status = "DRIFT" if (worse_ll or worse_brier) else "stabil"
+    detail = (
+        f"Kalibrerad log-loss {cur_ll:.4f} (snitt senaste {len(trailing)}: {avg_ll:.4f}), "
+        f"Brier {cur_brier:.4f} (snitt: {avg_brier:.4f})."
+    )
+    if status == "DRIFT":
+        detail += " >=15% sämre än det rullande snittet — värt att se över features/half-life/data."
+    return {"status": status, "detail": detail, "n_history": len(previous) + 1}
+
+
 def apply_news_adjustments(scored: pd.DataFrame, adjustments: dict[str, float]) -> pd.DataFrame:
     """Vikta om model_p med nyhetsjusteringar innan rankning/system.
 
@@ -627,7 +698,8 @@ def main(argv: list[str] | None = None) -> int:
     print("Tränar modell på historiska starter…")
     evaluation = run_mvp(HISTORY_CSV)
     historical = load_starters(HISTORY_CSV)
-    fitted = fit_full(historical)
+    fitted = fit_full(historical, calibrator=evaluation.calibrator)
+    drift = track_calibration_history(evaluation.metrics)
     scored = score_starters(fitted, pd.DataFrame(rows))
     scored = apply_news_adjustments(scored, news.adjustments)
     suggestion = build_suggestion(scored)

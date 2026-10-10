@@ -9,12 +9,20 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
     accuracy_score,
     brier_score_loss,
     log_loss,
     roc_auc_score,
 )
+
+# Halveringstid för recency-vikt vid träning: en start för ~RECENCY_HALF_LIFE_DAYS
+# dagar sedan referenspunkten väger hälften av en start på referenspunkten.
+# Vald som en rimlig kompromiss för trav (säsonger, form, stall-ombyten) utan
+# att vara ett eget forskningsprojekt — lätt att justera om kalibreringshistoriken
+# (se calibration_history.jsonl) visar att modellen glömmer för snabbt/långsamt.
+RECENCY_HALF_LIFE_DAYS = 180.0
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data" / "atg_starters.csv"
@@ -106,6 +114,8 @@ class MvpResult:
     metrics: dict[str, Any] = field(default_factory=dict)
     feature_importance: pd.DataFrame = field(default_factory=pd.DataFrame)
     race_picks: pd.DataFrame = field(default_factory=pd.DataFrame)
+    calibration_curve: list[dict[str, Any]] = field(default_factory=list)
+    calibrator: IsotonicRegression | None = None
 
 
 def load_starters(path: Path | None = None) -> pd.DataFrame:
@@ -181,6 +191,51 @@ def feature_matrix(
     return X, medians
 
 
+def recency_weights(
+    dates: pd.Series, reference_date, half_life_days: float = RECENCY_HALF_LIFE_DAYS
+) -> np.ndarray:
+    """Exponentiellt avtagande träningsvikt: nyare starter väger mer.
+
+    weight = 0.5 ** (days_before_reference / half_life_days), golvat vid en
+    liten positiv konstant så ingen rad får vikt exakt 0 (HistGradientBoosting
+    kräver vikt > 0 om sample_weight ges).
+    """
+    ref = pd.Timestamp(reference_date)
+    days_before = (ref - pd.to_datetime(dates)).dt.days.clip(lower=0).astype(float)
+    weights = 0.5 ** (days_before / max(half_life_days, 1e-6))
+    return weights.clip(lower=1e-3).to_numpy()
+
+
+def calibration_curve_ece(
+    proba: np.ndarray, y: pd.Series, n_bins: int = 10
+) -> tuple[list[dict[str, Any]], float]:
+    """Binned reliability-kurva + Expected Calibration Error.
+
+    Jämför förutsagd sannolikhet mot faktisk utfallsfrekvens inom bins av
+    predikterad sannolikhet (kvantilbins, så varje bin har ungefär lika
+    många observationer även med den kraftigt sneda vinst-basraten i trav).
+    ECE = sum över bins av (andel av N i binnen) * |mean_pred - mean_actual|.
+    """
+    frame = pd.DataFrame({"p": np.asarray(proba, dtype=float), "y": pd.Series(y).astype(int).to_numpy()})
+    if frame.empty:
+        return [], 0.0
+    try:
+        frame["bin"] = pd.qcut(frame["p"], q=min(n_bins, frame["p"].nunique()), duplicates="drop")
+    except ValueError:
+        frame["bin"] = 0
+    curve = []
+    ece = 0.0
+    n_total = len(frame)
+    for _, group in frame.groupby("bin", observed=True):
+        mean_pred = float(group["p"].mean())
+        mean_actual = float(group["y"].mean())
+        n = len(group)
+        curve.append({"n": n, "mean_predicted": mean_pred, "mean_actual": mean_actual})
+        ece += (n / n_total) * abs(mean_pred - mean_actual)
+    curve.sort(key=lambda row: row["mean_predicted"])
+    return curve, float(ece)
+
+
 def prepare_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     X, _medians = feature_matrix(df)
     y = df["won"].astype(int)
@@ -209,15 +264,32 @@ def run_mvp(path: Path | None = None) -> MvpResult:
     Xte, yte = X[test_mask], y[test_mask]
     df_te = df[test_mask].copy()
 
+    # Recency-vikt relativt cut_date (INTE "idag") så att tidsplit-utvärderingen
+    # är reproducerbar oavsett när den körs: träningsraderna strax före
+    # cut_date väger mer än de äldsta, som om vi faktiskt stod vid cut_date.
+    train_weights = recency_weights(df.loc[train_mask, "date"], reference_date=cut_date)
+
     clf = new_classifier()
-    clf.fit(Xtr, ytr)
+    clf.fit(Xtr, ytr, sample_weight=train_weights)
     proba = clf.predict_proba(Xte)[:, 1]
     pred = (proba >= 0.5).astype(int)
+
+    # Kalibrera på SAMMA tidsplit-holdout: det är de mest nyligen avslutade
+    # loppen modellen ännu inte tränats på, dvs. precis vad en
+    # prediktion-mot-utfall-feedbackloop ska jämföra mot. Isotonic är monoton
+    # och parameterfri nog för de datamängder vi har (tiotusental rader).
+    calibrator = IsotonicRegression(out_of_bounds="clip")
+    calibrator.fit(proba, yte.to_numpy())
+    calibration_curve, calibration_ece = calibration_curve_ece(proba, yte)
+    calibrated_proba = calibrator.predict(proba)
 
     metrics: dict[str, Any] = {
         "log_loss": float(log_loss(yte, proba)),
         "brier": float(brier_score_loss(yte, proba)),
         "accuracy_0_5": float(accuracy_score(yte, pred)),
+        "calibration_ece": float(calibration_ece),
+        "calibrated_log_loss": float(log_loss(yte, calibrated_proba)),
+        "calibrated_brier": float(brier_score_loss(yte, calibrated_proba)),
         "n_total": int(len(df)),
         "n_train": int(len(Xtr)),
         "n_test": int(len(Xte)),
@@ -299,6 +371,8 @@ def run_mvp(path: Path | None = None) -> MvpResult:
         metrics=metrics,
         feature_importance=fi,
         race_picks=race_picks,
+        calibration_curve=calibration_curve,
+        calibrator=calibrator,
     )
 
 
@@ -309,26 +383,49 @@ class FittedMvp:
     clf: HistGradientBoostingClassifier
     medians: pd.Series
     n_rows: int
+    calibrator: IsotonicRegression | None = None
 
 
-def fit_full(df: pd.DataFrame) -> FittedMvp:
-    """Träna på alla rader med känd vinst (live-scoring, inte tidsplit)."""
+def fit_full(df: pd.DataFrame, calibrator: IsotonicRegression | None = None) -> FittedMvp:
+    """Träna på alla rader med känd vinst (live-scoring, inte tidsplit).
+
+    sample_weight: recency relativt den senaste kända starten i datan (inte
+    "idag" via systemklockan, så körningar är reproducerbara givet samma CSV).
+    calibrator: isotonic-kalibreraren från run_mvp():s tidsplit-holdout — det
+    är löpande "prediktion vs utfall"-återkopplingen. Den är fit på RAW
+    model_p från tidsplit-modellen, men den fulla modellen (tränad på allt,
+    inklusive holdout-perioden) ger nästan identisk sannolikhetsskala, så vi
+    återanvänder samma kalibreringsfunktion istället för att kräva en egen
+    holdout ur den fulla träningen (vilket skulle slösa bort färsk data).
+    """
     trainable = df.dropna(subset=["won"]).copy()
     trainable["won"] = trainable["won"].astype(int)
     X, medians = feature_matrix(trainable)
+    reference_date = trainable["date"].max()
+    weights = recency_weights(trainable["date"], reference_date=reference_date)
     clf = new_classifier()
-    clf.fit(X, trainable["won"].astype(int))
-    return FittedMvp(clf=clf, medians=medians, n_rows=int(len(trainable)))
+    clf.fit(X, trainable["won"].astype(int), sample_weight=weights)
+    return FittedMvp(clf=clf, medians=medians, n_rows=int(len(trainable)), calibrator=calibrator)
 
 
 def score_starters(fitted: FittedMvp, df: pd.DataFrame) -> pd.DataFrame:
-    """Lägg på model_p, market_p och value = model_p / market_p.
+    """Lägg på model_p (kalibrerad), model_p_raw, market_p och value.
+
+    model_p_raw är modellens direkta predict_proba. Om fitted.calibrator
+    finns (från run_mvp():s tidsplit-holdout, dvs. de senast avslutade
+    loppen) mappas model_p_raw genom den till model_p — det är själva
+    återkopplingslänken mellan "vad hände i de senaste loppen" och "hur
+    tolkar vi dagens sannolikheter". All nedströms-kod (rankning, system,
+    nyhetsjustering, beslutslager) läser model_p och får därmed kalibrerade
+    värden automatiskt, utan att behöva ändras.
 
     market_p är normaliserad 1/vinnarodds. Saknas den används poolandelen.
     """
     out = df.copy()
     X, _medians = feature_matrix(out, fitted.medians)
-    out["model_p"] = fitted.clf.predict_proba(X)[:, 1]
+    raw = fitted.clf.predict_proba(X)[:, 1]
+    out["model_p_raw"] = raw
+    out["model_p"] = fitted.calibrator.predict(raw) if fitted.calibrator is not None else raw
     if "market_implied_prob" in out.columns:
         market = pd.to_numeric(out["market_implied_prob"], errors="coerce")
     else:
