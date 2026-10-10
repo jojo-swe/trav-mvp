@@ -385,6 +385,7 @@ def render_report(
     ranked: dict,
     news,
     decision,
+    drift: dict,
     paths: dict[str, Path],
 ) -> str:
     lines = [
@@ -504,6 +505,24 @@ def render_report(
         f"Säkerhet: {decision.confidence}   Källa: {decision.source}",
         decision.headline,
         decision.rationale,
+    ]
+
+    lines += [
+        "",
+        "════════════════════════════════════════",
+        "KALIBRERING / DRIFT  (prediktion vs. utfall över tid)",
+        "════════════════════════════════════════",
+        (
+            f"Tidsplit-holdout (de senast avslutade loppen modellen inte tränats på): "
+            f"ECE={_fmt(metrics.get('calibration_ece'), '.4f')}  "
+            f"kalibrerad log-loss={_fmt(metrics.get('calibrated_log_loss'), '.4f')} "
+            f"(rå={_fmt(metrics.get('log_loss'), '.4f')})  "
+            f"kalibrerad Brier={_fmt(metrics.get('calibrated_brier'), '.4f')} "
+            f"(rå={_fmt(metrics.get('brier'), '.4f')})."
+        ),
+        f"Status: {drift['status']}   ({drift['n_history']} körningar loggade totalt)",
+        drift["detail"],
+        "Logg: data/calibration_history.jsonl (en rad per körning, används för drifttrenden ovan).",
     ]
 
     lines += [
@@ -731,6 +750,7 @@ def main(argv: list[str] | None = None) -> int:
         ranked=ranked,
         news=news,
         decision=decision,
+        drift=drift,
         paths=paths,
     )
     text_path.write_text(report, encoding="utf-8")
@@ -778,6 +798,15 @@ def main(argv: list[str] | None = None) -> int:
             "risk_flags": list(decision.risk_flags),
             "source": decision.source,
         },
+        "calibration": {
+            "ece": evaluation.metrics.get("calibration_ece"),
+            "log_loss_raw": evaluation.metrics.get("log_loss"),
+            "log_loss_calibrated": evaluation.metrics.get("calibrated_log_loss"),
+            "brier_raw": evaluation.metrics.get("brier"),
+            "brier_calibrated": evaluation.metrics.get("calibrated_brier"),
+            "reliability_curve": evaluation.calibration_curve,
+        },
+        "drift": drift,
         "legs": suggestion["legs"],
         "files": {name: str(path) for name, path in paths.items()},
     }
