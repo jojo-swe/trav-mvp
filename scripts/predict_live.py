@@ -10,6 +10,7 @@ Kör från repots rot:
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import math
 import sys
@@ -19,6 +20,10 @@ from itertools import product
 from pathlib import Path
 
 import pandas as pd
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 SCRIPTS = Path(__file__).resolve().parent
 if str(SCRIPTS) not in sys.path:
@@ -183,6 +188,88 @@ def build_suggestion(scored: pd.DataFrame) -> dict:
     }
 
 
+def rank_candidate_rows(scored: pd.DataFrame, max_rows: int = 50, per_leg: int = 4) -> dict:
+    """Full ranked lista över kandidatrader, bäst till sämst — inte bara en kollapsad rad.
+
+    Tar de `per_leg` högst rankade (på model_p) hästarna per avdelning och
+    rankar ALLA kombinationer av dem bäst-till-sämst på produkten av
+    model_p över avdelningarna (via summa av log-sannolikheter, vilket ger
+    samma ordning utan att behöva räkna ut varje produkt separat).
+
+    Att räkna ut *varenda* kombination av samtliga startande (utan att
+    begränsa per avdelning) är kombinatoriskt omöjligt för ett V85 — redan
+    11*12*11*15*12*12*... blir fort hundratals miljoner rader. Vi begränsar
+    därför till de `per_leg` mest sannolika per avdelning (konfigurerbart)
+    och rankar den fulla korsprodukten av DEM, bäst till sämst, med en
+    heap-baserad k-bästa-sökning (samma princip som "k smallest sums från
+    N sorterade listor") så att vi slipper bygga hela korsprodukten i
+    minnet när den är stor.
+    """
+    order = scored[["leg", "race_id"]].drop_duplicates().sort_values("leg")
+    leg_candidates: list[list[tuple[int, float, str]]] = []
+    for _, key in order.iterrows():
+        group = scored[scored["race_id"] == key["race_id"]].copy()
+        ranked_group = _rank(group, "model_p").head(max(per_leg, 1))
+        cands = [
+            (int(row["start_number"]), float(row["model_p"]), str(row["horse_name"]))
+            for _, row in ranked_group.iterrows()
+        ]
+        leg_candidates.append(cands)
+
+    n_legs = len(leg_candidates)
+    total_space = 1
+    for cands in leg_candidates:
+        total_space *= max(len(cands), 1)
+
+    if n_legs == 0 or any(not cands for cands in leg_candidates):
+        return {
+            "rows": [],
+            "candidates_per_leg": per_leg,
+            "total_candidate_space": 0,
+            "n_rows_returned": 0,
+        }
+
+    logs = [[math.log(max(p, 1e-9)) for _, p, _ in cands] for cands in leg_candidates]
+    start = tuple([0] * n_legs)
+    visited = {start}
+    heap: list[tuple[float, tuple[int, ...]]] = [
+        (-sum(logs[i][0] for i in range(n_legs)), start)
+    ]
+    want = min(max_rows, total_space)
+    results = []
+    while heap and len(results) < want:
+        neg_score, idxs = heapq.heappop(heap)
+        score = -neg_score
+        numbers = [leg_candidates[i][idxs[i]][0] for i in range(n_legs)]
+        names = [leg_candidates[i][idxs[i]][2] for i in range(n_legs)]
+        results.append(
+            {
+                "numbers": numbers,
+                "coupon": "-".join(str(n) for n in numbers),
+                "horse_names": names,
+                "combined_probability": math.exp(score),
+                "log_score": score,
+            }
+        )
+        for leg in range(n_legs):
+            if idxs[leg] + 1 < len(leg_candidates[leg]):
+                nxt = list(idxs)
+                nxt[leg] += 1
+                nxt_t = tuple(nxt)
+                if nxt_t not in visited:
+                    visited.add(nxt_t)
+                    s = sum(logs[i][nxt_t[i]] for i in range(n_legs))
+                    heapq.heappush(heap, (-s, nxt_t))
+    for rank, row in enumerate(results, start=1):
+        row["rank"] = rank
+    return {
+        "rows": results,
+        "candidates_per_leg": per_leg,
+        "total_candidate_space": total_space,
+        "n_rows_returned": len(results),
+    }
+
+
 def render_report(
     *,
     hit_date: str,
@@ -197,6 +284,7 @@ def render_report(
     n_distance_form: int,
     n_starters: int,
     suggestion: dict,
+    ranked: dict,
     paths: dict[str, Path],
 ) -> str:
     lines = [
@@ -278,7 +366,27 @@ def render_report(
 
     lines += [
         "════════════════════════════════════════",
-        "SYSTEM  (favoriter + value)",
+        "RANKADE RADER  (bäst till sämst, inte bara en kollapsad rad)",
+        "════════════════════════════════════════",
+        (
+            f"Topp {ranked['candidates_per_leg']} hästar (på model_p) per avdelning, "
+            f"alla kombinationer av dem rankade på kombinerad sannolikhet. "
+            f"Fullt korsutrymme med den begränsningen: {ranked['total_candidate_space']:,} rader. "
+            f"Visar {ranked['n_rows_returned']} högst rankade."
+        ),
+    ]
+    for row in ranked["rows"][:30]:
+        lines.append(
+            f"  {row['rank']:>3}. {row['coupon']:<24} "
+            f"P(hela raden)~={row['combined_probability']:.6f}"
+        )
+    if ranked["n_rows_returned"] > 30:
+        lines.append(f"  … {ranked['n_rows_returned'] - 30} fler rader i suggested_rows.json (ranked_rows).")
+
+    lines += [
+        "",
+        "════════════════════════════════════════",
+        "SYSTEM  (favoriter + value, legacy — se RANKADE RADER ovan för huvudresultatet)",
         "════════════════════════════════════════",
         f"Rad A  modellfavorit:  {suggestion['enkelrad']}",
         (
@@ -365,6 +473,18 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Startdatum YYYY-MM-DD. Standard är idag i Europe/Stockholm.",
     )
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=50,
+        help="Max antal rankade rader att beräkna/visa (standard 50).",
+    )
+    parser.add_argument(
+        "--candidates-per-leg",
+        type=int,
+        default=4,
+        help="Hur många topphästar (på model_p) per avdelning som ingår i rankningen (standard 4).",
+    )
     args = parser.parse_args(argv)
     if args.days < 1:
         print("days måste vara minst 1", file=sys.stderr)
@@ -435,6 +555,7 @@ def main(argv: list[str] | None = None) -> int:
     fitted = fit_full(historical)
     scored = score_starters(fitted, pd.DataFrame(rows))
     suggestion = build_suggestion(scored)
+    ranked = rank_candidate_rows(scored, max_rows=args.max_rows, per_leg=args.candidates_per_leg)
     track = next((row.get("track_name") for row in rows if row.get("track_name")), "")
     n_hist = sum(1 for row in rows if (row.get("prior_starts") or 0) > 0)
     n_dist = sum(1 for row in rows if (row.get("distance_starts_prior") or 0) > 0)
@@ -451,6 +572,7 @@ def main(argv: list[str] | None = None) -> int:
         n_distance_form=n_dist,
         n_starters=len(rows),
         suggestion=suggestion,
+        ranked=ranked,
         paths=paths,
     )
     text_path.write_text(report, encoding="utf-8")
@@ -478,6 +600,12 @@ def main(argv: list[str] | None = None) -> int:
         "system_notation": suggestion["system_notation"],
         "n_system_rows": suggestion["n_system_rows"],
         "system_rows": suggestion["system_rows"],
+        "ranked_rows": ranked["rows"],
+        "ranked_rows_meta": {
+            "candidates_per_leg": ranked["candidates_per_leg"],
+            "total_candidate_space": ranked["total_candidate_space"],
+            "n_rows_returned": ranked["n_rows_returned"],
+        },
         "legs": suggestion["legs"],
         "files": {name: str(path) for name, path in paths.items()},
     }
